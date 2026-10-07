@@ -9,7 +9,7 @@
 ![Methods](https://img.shields.io/badge/Retrieval_methods-4-1F3864?style=for-the-badge)
 ![Re-rankers](https://img.shields.io/badge/Re--rankers-3-2E5FD9?style=for-the-badge)
 ![Problems fixed](https://img.shields.io/badge/Reference_problems_fixed-10%2F10-6E86E8?style=for-the-badge)
-![Tests](https://img.shields.io/badge/Tests-55_passing-3DA35B?style=for-the-badge)
+![Tests](https://img.shields.io/badge/Tests-54_passing-3DA35B?style=for-the-badge)
 ![Offline demo](https://img.shields.io/badge/Offline_demo-Yes-F5C542?style=for-the-badge)
 ![License](https://img.shields.io/badge/License-MIT-A0399B?style=for-the-badge)
 
@@ -484,7 +484,7 @@ All results below come from `pytest` and from `stylematch demo` with seed `42`. 
 
 | Validation | Result | Command |
 |---|---|---|
-| Unit tests | **55 passed** locally. In CI: 54 passed, 1 skipped | `pytest -q` |
+| Unit tests | **55 passed** with the `ui` extra. In CI: 54 passed, 1 skipped because the `ui` extra is not installed | `pytest -q` |
 | nDCG@10 (synthetic) | `tfidf_unfiltered` 0.625, `tfidf` 0.890, `bm25` 0.911, `dense` 0.922, `hybrid` 0.924, `hybrid_attribute` 0.992 | `stylematch demo` |
 | Precision@10 (synthetic) | `tfidf_unfiltered` 0.642, `tfidf` 0.918, `hybrid` 0.945, `hybrid_attribute` 0.945 | `stylematch demo` |
 | nDCG@10 difference against `tfidf` (synthetic, 95 % interval) | `hybrid_attribute` +0.102 (0.049 to 0.166), `hybrid` +0.034 (0.000 to 0.082), `tfidf_unfiltered` -0.265 (-0.360 to -0.178) | `stylematch demo` |
