@@ -66,6 +66,7 @@ This README is the **one location that explains all of stylematch**. It gives th
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one query](#42-the-life-cycle-of-one-query)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 🔵 [Catalog, intent and index](#5-catalog-intent-and-index)
 6. 🟢 [Retrieval and re-ranking](#6-retrieval-and-re-ranking)
 7. 🟣 [Offline evaluation and the user study](#7-offline-evaluation-and-the-user-study)
@@ -133,6 +134,57 @@ flowchart LR
 | CLI | `src/stylematch/cli.py` | The `stylematch` command |
 | UI (optional) | `src/stylematch/app/streamlit_app.py` | Two systems side by side, with scores and reasons |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    subgraph ENTRY["Entry points"]
+        CLI["cli.py<br/>stylematch command"]
+        UI["app/streamlit_app.py<br/>optional UI"]
+    end
+    subgraph DATA["Catalog and index"]
+        CFG["config.py<br/>Settings.from_env"]
+        SYN["synthetic.py<br/>write_synthetic"]
+        CAT["catalog.py<br/>load_catalog, normalize"]
+        TXT["text.py<br/>tokenize"]
+        EMB["embed.py<br/>make_embedder"]
+        IDX["index.py<br/>build_or_load, BM25"]
+    end
+    subgraph SEARCH["Search"]
+        REC["recommender.py<br/>Recommender.recommend"]
+        INT["intent.py<br/>parse_query"]
+        RET["retrieve.py<br/>filter_rows, retrieve"]
+        RR["rerank.py<br/>make_reranker, validate_ranking"]
+        LLM["llm.py<br/>OpenAICompatibleClient"]
+    end
+    subgraph MEASURE["Measure"]
+        EVA["evaluate.py<br/>evaluate, make_pool"]
+        STU["study.py<br/>make_plan, analyze"]
+    end
+
+    CLI --> CFG
+    CLI --> SYN
+    CLI --> IDX
+    CLI --> REC
+    CLI --> EVA
+    CLI --> STU
+    CLI -- "ui" --> UI
+    UI --> IDX
+    UI --> REC
+    IDX --> CAT
+    IDX --> EMB
+    IDX --> TXT
+    CAT --> TXT
+    INT --> CAT
+    INT --> TXT
+    REC --> INT
+    REC --> RET
+    REC --> RR
+    REC --> LLM
+    RR --> LLM
+    EVA --> REC
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -176,6 +228,23 @@ stylematch/
 ### 3.2 One pool for every method
 `retrieve.filter_rows` applies the gender and price filters before any method runs. The `tfidf` baseline, `bm25`, `dense` and `hybrid` get the same pool and the same search text.
 
+```mermaid
+flowchart LR
+    I[/"Intent<br/>gender, min_price, max_price"/] --> F["retrieve.filter_rows<br/>gender in allowed_genders,<br/>price inside the limits"]
+    P[("Index products")] --> F
+    F --> POOL["One pool of rows"]
+    S[/"intent.search_text<br/>query + expansion terms"/] --> POOL
+    POOL --> T["tfidf"]
+    POOL --> B["bm25"]
+    POOL --> D["dense"]
+    POOL --> H["hybrid<br/>RRF of bm25 and dense"]
+    P -. "tfidf_unfiltered only,<br/>for reference" .-> T
+    T --> C[/"Candidates of each method"/]
+    B --> C
+    D --> C
+    H --> C
+```
+
 ### 3.3 The index is built once
 `index.build_or_load` saves the index with a fingerprint. If the catalog and the embedder do not change, the next run loads the index. A query embeds only the query text.
 
@@ -201,31 +270,67 @@ The core needs NumPy, pandas, SciPy and scikit-learn. The chat model and the emb
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    subgraph build["once: stylematch index"]
-        CAT["catalog.csv"] --> NORM["normalize + remove contacts"]
-        NORM --> FP{"fingerprint changed?"}
-        FP -->|"no"| LOAD["load the saved index"]
-        FP -->|"yes"| BUILD["TF-IDF + BM25 + embedder vectors"] --> SAVE["artifacts/index"]
-    end
-    subgraph query["each query"]
-        Q["query + optional limits"] --> INT["intent: gender, price, category, colour, occasion"]
-        INT --> FIL["hard filters: gender, price"]
-        FIL --> RET["method: tfidf / bm25 / dense / hybrid (RRF)"]
-        RET --> RR["re-ranker: none / attribute / llm"]
-        RR --> VAL["ID validation against candidates"]
-        VAL --> OUT["products + scores + reasons"]
-    end
-    subgraph eval["evaluation"]
-        GOLD["gold set"] --> MET["precision, recall, nDCG, MRR, coverage, diversity"]
-        PLAN["blinded study plan"] --> ANA["Wilcoxon + effect sizes + verdict"]
-    end
-    LOAD --> RET
-    SAVE --> RET
-    OUT --> MET
+flowchart TD
+    CAT[/"catalog.csv"/] --> NORM["catalog.normalize<br/>column contract, remove contacts"]
+    NORM --> FP{"Fingerprint same as<br/>manifest.json?"}
+    FP -- "yes" --> LOAD["index.load_index"]
+    FP -- "no" --> BUILD["index.build_index<br/>TF-IDF, BM25, embedder vectors"]
+    BUILD --> IDX[("artifacts/index")]
+    LOAD --> IDX
+    Q[/"Query + optional gender and price limits"/] --> INT["intent.parse_query<br/>gender, price, category, colour, occasion"]
+    INT --> FIL["retrieve.filter_rows<br/>gender and price"]
+    IDX --> FIL
+    FIL --> RET["retrieve: tfidf, bm25, dense or hybrid RRF<br/>top 50 candidates"]
+    RET --> ANY{"Any candidate?"}
+    ANY -- "no" --> NOTE[/"No products, a note:<br/>change the budget or the gender"/]
+    ANY -- "yes" --> RR["Re-ranker: none, attribute or llm"]
+    RR --> VAL["validate_ranking and index.has<br/>only candidate IDs"]
+    VAL --> OUT[/"Top k products,<br/>retrieval scores, reasons"/]
+    OUT -. "every system,<br/>every query" .-> POOL["stylematch pool<br/>shuffled, no system names"]
+    POOL --> LAB{{"HUMAN<br/>grade each row 0, 1 or 2"}}
+    LAB --> GOLD[("Gold set<br/>gold.jsonl or labels.csv")]
+    GOLD --> EVAL["stylematch evaluate<br/>precision, recall, nDCG, MRR,<br/>coverage, diversity, bootstrap"]
+    EVAL --> REP[/"reports/: summary.csv,<br/>comparisons.csv"/]
+    OUT -. "two systems" .-> PLAN["stylematch study-plan<br/>sheet.csv + hidden key.csv"]
+    PLAN --> RATE{{"HUMAN<br/>participants rate each list 1 to 10"}}
+    RATE --> ANA["stylematch study-analyze<br/>Wilcoxon, effect sizes, bootstrap"]
+    ANA --> VER[/"Study verdict"/]
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class LAB,RATE human
 ```
 
 ### 4.2 The life cycle of one query
+
+```mermaid
+stateDiagram-v2
+    state "Query text" as Query
+    state "Intent" as Intent
+    state "Pool of rows" as Pool
+    state "Candidates" as Cands
+    state "Ordered by none or attribute" as Ordered
+    state "LLM reply" as Reply
+    state "Validated IDs" as Valid
+    state "Retrieval order kept, with a note" as Fallback
+    state "Empty result, with a note" as Empty
+    state "Shown products" as Shown
+    [*] --> Query: user gives a query and optional limits
+    Query --> ValueError: empty query, unknown gender or min_price above max_price
+    Query --> Intent: parse_query
+    Intent --> Pool: filter_rows
+    Pool --> Empty: no row, or no score above 0
+    Pool --> Cands: method scores, top 50
+    Cands --> Ordered: rerank
+    Cands --> Reply: llm re-ranker, top 20 sent
+    Reply --> Valid: validate_ranking
+    Reply --> Fallback: reply not usable
+    Ordered --> Shown: index.has, template_reason
+    Valid --> Shown: index.has, chat model reason
+    Fallback --> Shown: index.has, template_reason
+    Shown --> [*]
+    Empty --> [*]
+    ValueError --> [*]
+```
 
 1. Parse the query into an intent.
 2. Apply the gender filter and the price filter to the catalog. The result is the pool.
@@ -235,11 +340,106 @@ flowchart TB
 6. Remove each ID that is not a candidate. Append the candidates that the re-ranker left out.
 7. Return the top k products with the retrieval score and a reason.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as Shopper or analyst
+    participant CLI as stylematch CLI
+    participant IDX as index.py
+    participant FS as artifacts/index
+    participant REC as Recommender
+    participant RET as retrieve.py
+    participant RR as LLMReranker
+    participant LLM as Chat model API
+
+    U->>CLI: stylematch recommend query --rerank llm
+    CLI->>CLI: Settings.from_env
+    CLI->>IDX: build_or_load(catalog, index_dir, settings)
+    IDX->>FS: read manifest.json, compare the fingerprint
+    FS-->>IDX: saved index, or build and save a new index
+    IDX-->>CLI: Index
+    CLI->>REC: recommend(query, k, method, reranker)
+    REC->>REC: parse_query
+    REC->>RET: retrieve(index, intent, method, k)
+    RET-->>REC: candidates, pool size, filters
+    REC->>RR: rerank(intent, candidates, products)
+    RR->>LLM: POST /chat/completions, top 20 candidates, JSON mode
+    LLM-->>RR: JSON ranking with id and reason
+    RR->>RR: validate_ranking
+    RR-->>REC: ordered IDs, reasons, dropped IDs
+    REC->>REC: index.has, template_reason if no reason
+    REC-->>CLI: Recommendation
+    CLI-->>U: ranked products, scores, reasons, notes
+```
+
 ---
 
 ## 5. Catalog, intent and index
 
 **Purpose.** Load the catalog once, understand the query and keep a saved index.
+
+The catalog loader, `catalog.normalize`:
+
+```mermaid
+flowchart TD
+    IN[/"catalog.csv<br/>public or synthetic headers"/] --> MAP["Map the headers to COLUMNS<br/>by a lower-case key"]
+    MAP --> REQ{"Required column absent?<br/>product_id, name, gender, price"}
+    REQ -- "yes" --> ERR[/"CatalogError"/]
+    REQ -- "no" --> PID{"Empty product_id?"}
+    PID -- "yes" --> ERR
+    PID -- "no" --> PR{"Price not a number<br/>or below 0?"}
+    PR -- "yes" --> ERR
+    PR -- "no" --> CLEAN["Strip the text, colour to lower case,<br/>normalize_gender"]
+    CLEAN --> SCRUB["scrub_contacts on the description"]
+    SCRUB --> DER["infer_category from the name,<br/>price_band from the price"]
+    DER --> DUP["Drop duplicate product_id,<br/>keep the first"]
+    DUP --> OUT[/"Normalized catalog"/]
+```
+
+The intent parser, `intent.parse_query`:
+
+```mermaid
+flowchart LR
+    Q[/"Query text, optional gender,<br/>min_price, max_price"/] --> E{"Query empty?"}
+    E -- "yes" --> ERR[/"ValueError"/]
+    E -- "no" --> G["Gender words<br/>boys, girls, kids, women, men"]
+    G --> P["Price patterns<br/>between, under, over"]
+    P --> C["CATEGORY_KEYWORDS<br/>and COLOURS"]
+    C --> O["OCCASIONS<br/>add the expansion terms"]
+    O --> X["Explicit arguments<br/>override the text"]
+    X -- "unknown gender" --> ERR
+    X --> M{"min_price above<br/>max_price?"}
+    M -- "yes" --> ERR
+    M -- "no" --> OUT[/"Intent<br/>search_text = query + expansion"/]
+```
+
+The index, `index.build_or_load`:
+
+```mermaid
+flowchart TD
+    CAT[/"Normalized catalog"/] --> FP["fingerprint: SHA-256 of the index version,<br/>embedder, embed model and catalog"]
+    FP --> SAME{"Same as<br/>manifest.json?"}
+    SAME -- "yes" --> LOAD["load_index<br/>check the index version"]
+    SAME -- "no" --> TXT["document_text for each product<br/>name, brand, gender, category, colour, description"]
+    TXT --> TF["TfidfVectorizer<br/>sublinear tf"]
+    TXT --> BM["BM25 counts<br/>k1 1.5, b 0.75"]
+    TXT --> EMB{"make_embedder"}
+    EMB -- "lsa" --> LSA["TF-IDF 1 and 2 word grams<br/>+ TruncatedSVD, up to 128 dims"]
+    EMB -- "openai" --> OAI["POST /embeddings"]
+    EMB -- "sentence-transformers" --> STM["Local model<br/>all-MiniLM-L6-v2 by default"]
+    LSA --> VEC["Unit-length vectors"]
+    OAI --> VEC
+    STM --> VEC
+    TF --> SAVE["Index.save"]
+    BM --> SAVE
+    VEC --> SAVE
+    SAVE --> DIR[("artifacts/index<br/>manifest.json, products.csv,<br/>matrices, vectors")]
+    DIR -. "next run" .-> LOAD
+    SAVE --> OUT[/"Index"/]
+    LOAD --> OUT
+```
 
 | Input | Output |
 |---|---|
@@ -256,7 +456,7 @@ flowchart TB
 
 **Rules**
 
-- A missing required column or a price that is not a number stops the load.
+- A missing required column, an empty product ID, or a price that is not a number or is below 0 stops the load.
 - An explicit `--gender`, `--min-price` or `--max-price` overrides the query text.
 - A gender query keeps unisex products: `women` matches `women` and `unisex`.
 
@@ -274,6 +474,48 @@ flowchart TB
 
 **Purpose.** Find the best candidates in the pool and order them.
 
+The retrievers, `retrieve.retrieve`:
+
+```mermaid
+flowchart TD
+    IN[/"Intent and index"/] --> F{"use_filters?"}
+    F -- "yes" --> FR["filter_rows<br/>gender, price"]
+    F -- "no, tfidf_unfiltered" --> ALL["All rows"]
+    FR --> EMPTY{"Pool empty?"}
+    EMPTY -- "yes" --> NONE[/"No candidates"/]
+    EMPTY -- "no" --> M{"Method"}
+    ALL --> M
+    M -- "tfidf" --> T["Cosine of TF-IDF vectors,<br/>score above 0 only"]
+    M -- "bm25" --> B["BM25 scores,<br/>score above 0 only"]
+    M -- "dense" --> D["Dot product of unit vectors,<br/>only the query is embedded"]
+    M -- "hybrid" --> H["bm25 list + dense list"]
+    H --> RRF["RRF: sum of 1 / (60 + rank)"]
+    T --> TOP[/"Top candidates<br/>STYLEMATCH_CANDIDATES, default 50"/]
+    B --> TOP
+    D --> TOP
+    RRF --> TOP
+```
+
+The re-rankers, `rerank.make_reranker`:
+
+```mermaid
+flowchart TD
+    C[/"Candidates in retrieval order"/] --> R{"Re-ranker"}
+    R -- "none" --> N["Keep the retrieval order"]
+    R -- "attribute" --> A["score / top score<br/>+ 1.0 category, + 0.5 colour,<br/>+ 0.3 expansion term"]
+    R -- "llm" --> K{"Chat model<br/>configured?"}
+    K -- "no" --> ERR[/"ValueError"/]
+    K -- "yes" --> L["Send the top 20 candidates<br/>id, name, brand, gender,<br/>category, colour, price"]
+    L --> J{"Reply is JSON<br/>with a ranking list?"}
+    J -- "no" --> FB["Keep the retrieval order,<br/>add a note"]
+    J -- "yes" --> V["validate_ranking<br/>drop other IDs and repeats,<br/>append the missing candidates"]
+    V --> RS["Keep the reasons of valid IDs,<br/>300 characters maximum"]
+    N --> OUT[/"Ranked product IDs"/]
+    A --> OUT
+    FB --> OUT
+    RS --> OUT
+```
+
 | Input | Output |
 |---|---|
 | The intent, the index | Up to 50 candidates, then the top k products with reasons |
@@ -287,7 +529,7 @@ flowchart TB
 5. The `attribute` re-ranker adds 1.0 for a category match, 0.5 for a colour match and 0.3 for an expansion term.
 6. The `llm` re-ranker sends up to 20 candidates (ID, name, brand, gender, category, colour, price) to the chat model.
 7. The chat model must reply with JSON: `{"ranking": [{"id": ..., "reason": ...}]}`.
-8. If the reply is not valid JSON, the recommender keeps the retrieval order and adds a note.
+8. If the reply is not valid JSON or has no `ranking` list, the recommender keeps the retrieval order and adds a note.
 
 **Rules**
 
@@ -307,6 +549,43 @@ flowchart TB
 ## 7. Offline evaluation and the user study
 
 **Purpose.** Compare the systems with labelled queries and with people.
+
+The offline evaluation, `evaluate.evaluate`:
+
+```mermaid
+flowchart LR
+    G[/"Gold set<br/>JSONL or labelled CSV"/] --> LG["load_gold<br/>keep grades above 0"]
+    LG --> RUN["default_systems<br/>run each system on each query"]
+    RUN --> PQ["Per query: precision@k, recall@k,<br/>nDCG@k, MRR, hit, brand diversity"]
+    PQ --> SUM["Mean by system,<br/>coverage = shown / catalog size"]
+    PQ --> CMP["paired_bootstrap, 2000 samples<br/>nDCG difference against tfidf"]
+    PQ --> KIND[/"nDCG by query kind<br/>printed table"/]
+    SUM --> OUT[("reports/eval<br/>per_query.csv, summary.csv,<br/>comparisons.csv")]
+    CMP --> OUT
+```
+
+The user study, `study.make_plan` and `study.analyze`:
+
+```mermaid
+flowchart TD
+    Q[/"queries.jsonl, participants,<br/>systems a and b"/] --> PL["make_plan<br/>random query order for each participant"]
+    PL --> FLIP["Coin flip for each query<br/>which system makes List 1"]
+    FLIP --> SH[/"sheet.csv with both lists,<br/>no system names"/]
+    FLIP --> KEY[("key.csv<br/>kept hidden")]
+    SH --> RATE{{"HUMAN<br/>participants rate each list 1 to 10"}}
+    RATE --> UNB["unblind<br/>join the ratings with the key"]
+    KEY --> UNB
+    UNB --> RNG{"Rating outside<br/>1 to 10?"}
+    RNG -- "yes" --> ERR[/"ValueError"/]
+    RNG -- "no" --> PP["Mean difference a minus b<br/>for each participant"]
+    PP --> TST["Wilcoxon, paired t test, Cohen dz,<br/>rank-biserial, bootstrap 5000"]
+    TST --> V{"Wilcoxon p below 0.05<br/>and interval excludes 0?"}
+    V -- "yes" --> PREF[/"participants preferred a or b"/]
+    V -- "no" --> NOD[/"no evidence of a difference"/]
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class RATE human
+```
 
 | Input | Output |
 |---|---|
@@ -350,6 +629,21 @@ flowchart TB
 
 ## 8. Decision rules and the safety model
 
+The diagram shows the two checks that keep an invented product out of the result.
+
+```mermaid
+flowchart LR
+    IDS[/"IDs from the chat model"/] --> V1{"In the candidates<br/>sent to the model?"}
+    V1 -- "no" --> DROP["dropped_ids<br/>a note in the result"]
+    V1 -- "yes" --> V2{"Seen before?"}
+    V2 -- "yes" --> SKIP["Skip the repeat"]
+    V2 -- "no" --> ORD["Ordered IDs"]
+    ORD --> APP["Append the candidates<br/>that the model left out"]
+    APP --> V3{"index.has<br/>the ID?"}
+    V3 -- "no" --> HIDE["Do not show"]
+    V3 -- "yes" --> SHOW[/"Product row from the catalog,<br/>retrieval score, reason"/]
+```
+
 | Rule | Value | Code |
 |---|---|---|
 | Candidates per method | `STYLEMATCH_CANDIDATES`, default 50 | `retrieve.py` |
@@ -385,7 +679,7 @@ flowchart TB
 | `artifacts/index/` | No (git ignores it) | `manifest.json`, `products.csv`, `tfidf.joblib`, `tfidf_matrix.npz`, `bm25.json`, `bm25_counts.npz`, `vectors.npy`, `embedder.joblib` |
 | `reports/` | No (git ignores it) | `per_query.csv`, `summary.csv`, `comparisons.csv`, `pool.csv`, demo output |
 | `study/` | No (git ignores it) | `sheet.csv`, `key.csv`, ratings |
-| `.env` | No (git ignores it) | Local settings and the API key |
+| `.env` | No (git ignores it) | Local settings and the API key. stylematch does not load it: export the values in the shell |
 | `.env.example` | Yes | Variable names only |
 
 ---
@@ -436,7 +730,24 @@ stylematch ui                                                   # needs the ui e
 pytest -q
 ```
 
-To use a chat model, set the key in `.env` or in the shell. Then use `--rerank llm`:
+The diagram shows the order of the commands and the files that connect them.
+
+```mermaid
+flowchart LR
+    INS["pip install -e .[dev]"] --> SYN["stylematch synth"]
+    SYN --> DATA[("data/catalog.csv<br/>data/gold.jsonl")]
+    DATA --> IDX["stylematch index"]
+    IDX --> ART[("artifacts/index")]
+    ART --> REC["stylematch recommend"]
+    ART --> EVA["stylematch evaluate"]
+    ART --> POOL["stylematch pool"]
+    ART --> PLAN["stylematch study-plan"]
+    PLAN --> ANA["stylematch study-analyze"]
+    ART --> UI["stylematch ui"]
+    INS --> DEMO["stylematch demo<br/>synthetic data, files in reports/demo"]
+```
+
+To use a chat model, set the key in the shell. stylematch does not read a `.env` file, so export its values first. Then use `--rerank llm`:
 
 ```bash
 export STYLEMATCH_LLM_API_KEY=...        # or OPENAI_API_KEY
@@ -460,7 +771,21 @@ stylematch recommend "office wear for women" --rerank llm
 | `STYLEMATCH_CANDIDATES` | retrievers | Candidates per method, default `50` |
 | `STYLEMATCH_SEED` | LSA, pool, study | Random seed, default `42` |
 
-Credentials are only in a local `.env` file or in the shell. Git ignores `.env`. Do not print or commit credentials.
+stylematch reads the variables from the process environment only. It does not load a `.env` file. Keep credentials in the shell or in a local `.env` file that you export. Git ignores `.env`. Do not print or commit credentials.
+
+```mermaid
+flowchart LR
+    ENV[/"Process environment"/] --> KEY{"STYLEMATCH_LLM_API_KEY<br/>or OPENAI_API_KEY set?"}
+    KEY -- "yes" --> PO["Default provider openai"]
+    KEY -- "no" --> PN["Default provider none"]
+    PO --> SET["Settings.from_env<br/>type, minimum and choice checks"]
+    PN --> SET
+    SET --> CHK{"Values valid?"}
+    CHK -- "no" --> ERR[/"ValueError"/]
+    CHK -- "yes" --> HAS{"has_llm<br/>provider not none and a key"}
+    HAS -- "yes" --> LLM[/"llm re-ranker and<br/>openai embedder can run"/]
+    HAS -- "no" --> OFF[/"Offline: lsa embedder,<br/>none and attribute re-rankers"/]
+```
 
 ---
 
